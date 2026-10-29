@@ -1,0 +1,58 @@
+import SwiftUI
+
+struct SidebarView: View {
+    @Environment(AppModel.self) private var model
+    @State private var blocksExpanded = false
+
+    /// `List(selection:)` wants an optional binding; clicking empty space must not deselect the sidebar.
+    private var selection: Binding<SidebarItem?> {
+        Binding(
+            get: { model.sidebar },
+            set: { newValue in
+                if let newValue { model.sidebar = newValue }
+            }
+        )
+    }
+
+    var body: some View {
+        List(selection: selection) {
+            Section("Library") {
+                Label("All Characters", systemImage: "character.book.closed")
+                    .tag(SidebarItem.all)
+                Label("Favorites", systemImage: "star")
+                    .badge(model.favorites.count)
+                    .tag(SidebarItem.favorites)
+                Label("Recents", systemImage: "clock")
+                    .tag(SidebarItem.recents)
+            }
+
+            if let font = model.customFont {
+                Section("Opened Font") {
+                    Label(font.displayName, systemImage: "textformat")
+                        .tag(SidebarItem.customFont)
+                        .contextMenu {
+                            Button("Close Font") { model.closeFont() }
+                        }
+                }
+            }
+
+            if let database = model.database {
+                Section("Collections") {
+                    ForEach(database.collections) { collection in
+                        Label(AppModel.collectionTitle(collection.id), systemImage: collection.symbol)
+                            .tag(SidebarItem.collection(collection.id))
+                    }
+                }
+
+                Section("Unicode Blocks", isExpanded: $blocksExpanded) {
+                    ForEach(database.populatedBlocks) { block in
+                        Text(block.name)
+                            .lineLimit(1)
+                            .tag(SidebarItem.block(block.index))
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+    }
+}

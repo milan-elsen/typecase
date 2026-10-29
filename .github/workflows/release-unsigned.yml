@@ -1,0 +1,64 @@
+name: Unsigned build for friends
+
+# Builds a universal (Apple silicon + Intel) Typecase.app with the Direct configuration (not sandboxed, so Return can
+# insert into other apps), signed ad hoc (no Apple Developer account), and uploads a .dmg and a .zip as a workflow
+# artifact. Run it from the Actions tab; download the artifact from the run page.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Release-Direct, universal, ad hoc signed)
+        run: |
+          set -o pipefail
+          xcodebuild -project Typecase.xcodeproj -scheme "Typecase (Direct)" -configuration Release-Direct \
+            -destination 'generic/platform=macOS' -derivedDataPath build \
+            ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee build.log | tail -n 25
+
+      - name: Inspect
+        run: |
+          APP=build/Build/Products/Release-Direct/Typecase.app
+          ls -la "$APP/Contents/MacOS" "$APP/Contents/Resources" | head -40
+          lipo -info "$APP/Contents/MacOS/Typecase"
+          codesign -dvv "$APP" 2>&1 | head -20
+          codesign --verify --deep --strict "$APP" && echo "signature ok (ad hoc)"
+          du -sh "$APP"
+
+      - name: Package
+        run: |
+          APP=build/Build/Products/Release-Direct/Typecase.app
+          SHORT=$(echo "$GITHUB_SHA" | cut -c1-7)
+          mkdir -p dist dmgroot
+          cat > "dmgroot/Read me first.txt" <<'EOS'
+          Typecase (unsigned build)
+
+          1. Drag Typecase into the Applications folder.
+          2. This build is not signed by Apple, so macOS blocks it the first time.
+             Open Typecase once, then go to System Settings > Privacy & Security, scroll down and click
+             "Open Anyway" next to the message about Typecase. Confirm with your password.
+             (Alternative, in Terminal:  xattr -dr com.apple.quarantine /Applications/Typecase.app )
+          3. To let Return type characters straight into other apps, allow Typecase under
+             System Settings > Privacy & Security > Accessibility. Without it, Return copies the character
+             and shows a banner; press Command-V to paste. Because the app is not signed with a developer
+             certificate, macOS may ask for this permission again after you install an update.
+
+          Quick Lookup opens with Control-Option-Space (changeable in Settings).
+          EOS
+          sed -i '' 's/^          //' "dmgroot/Read me first.txt"
+          cp -R "$APP" dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "Typecase" -srcfolder dmgroot -ov -format UDZO "dist/Typecase-$SHORT-unsigned.dmg"
+          ditto -c -k --keepParent "$APP" "dist/Typecase-$SHORT-unsigned.zip"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Typecase-unsigned
+          path: dist/*
+          retention-days: 30

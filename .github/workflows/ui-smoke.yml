@@ -1,0 +1,267 @@
+name: UI smoke test
+
+# Launches the built app on a macOS runner, drives it with keystrokes, and publishes screenshots plus logs to the
+# `ci-artifacts` branch. Run it manually from the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image (macos-15, macos-26 ...)"
+        default: "macos-15"
+        type: string
+      app_ref:
+        description: "Optional commit to build the app from (for before/after comparisons)"
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  smoke:
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.app_ref || github.sha }}
+
+      - name: Build (Debug)
+        run: |
+          set -o pipefail
+          xcodebuild -project Typecase.xcodeproj -scheme Typecase -configuration Debug \
+            -destination 'platform=macOS' -derivedDataPath build build 2>&1 | tail -n 5
+
+      - name: Launch and drive the app
+        continue-on-error: true
+        run: |
+          mkdir -p out
+          APP=build/Build/Products/Debug/Typecase.app
+          say() { echo "### $*" | tee -a out/log.txt; }
+          sw_vers | tee -a out/log.txt
+          system_profiler SPDisplaysDataType 2>/dev/null | grep -i resolution | tee -a out/log.txt || true
+
+          say "launch"
+          open "$APP"; sleep 10
+          pgrep -lx Typecase | tee -a out/log.txt || say "NOT RUNNING after launch"
+          screencapture -x out/1-launch.png
+
+          say "search in main window"
+          osascript -e 'tell application "Typecase" to activate' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "f" using command down' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "thin space"' 2>&1 | tee -a out/log.txt; sleep 2
+          screencapture -x out/2-main-search.png
+
+          say "copy selected character with command-return"
+          osascript -e 'tell application "System Events" to key code 36 using {command down}' 2>&1 | tee -a out/log.txt; sleep 1
+          pbpaste | xxd | tee -a out/log.txt
+          screencapture -x out/3-after-copy.png
+
+          say "characters the system fonts lack: bundled fallback glyph, and no glyph at all"
+          osascript -e 'tell application "System Events" to keystroke "f" using command down' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "a" using command down' 2>&1 | tee -a out/log.txt
+          osascript -e 'tell application "System Events" to keystroke "U+11A00"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/23-bundled-fallback.png
+          osascript -e 'tell application "System Events" to keystroke "a" using command down' 2>&1 | tee -a out/log.txt
+          osascript -e 'tell application "System Events" to keystroke "U+14400"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/24-no-glyph.png
+          osascript -e 'tell application "System Events" to keystroke "a" using command down' 2>&1 | tee -a out/log.txt
+          osascript -e 'tell application "System Events" to key code 51' 2>&1 | tee -a out/log.txt; sleep 1
+
+          say "global hotkey: control-option-space"
+          osascript -e 'tell application "System Events" to key code 49 using {control down, option down}' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/4-quick-open.png
+          say "drag Quick Lookup by the loupe"
+          cat > /tmp/winlist.swift <<'EOS'
+          import CoreGraphics
+          import Foundation
+          let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+          for w in list where (w[kCGWindowOwnerName as String] as? String) == "Typecase" {
+              if let b = w[kCGWindowBounds as String] as? [String: Double] {
+                  print(Int(b["X"] ?? 0), Int(b["Y"] ?? 0), Int(b["Width"] ?? 0), Int(b["Height"] ?? 0))
+              }
+          }
+          EOS
+          echo "Typecase windows (x y w h): $(swift /tmp/winlist.swift 2>&1 | tr '\n' ';')" | tee -a out/log.txt
+          POS=$(swift /tmp/winlist.swift 2>/dev/null | awk '$3==640{print $1", "$2; exit}')
+          SIZE=$(swift /tmp/winlist.swift 2>/dev/null | awk '$3==640{print $3", "$4; exit}')
+          echo "window position before drag: $POS  size: $SIZE" | tee -a out/log.txt
+          WX=$(echo "$POS" | cut -d, -f1 | tr -d ' '); WY=$(echo "$POS" | cut -d, -f2 | tr -d ' ')
+          cat > /tmp/drag.swift <<'EOS'
+          import CoreGraphics
+          import Foundation
+          let a = CommandLine.arguments.dropFirst().map { Double($0)! }
+          let start = CGPoint(x: a[0], y: a[1])
+          let end = CGPoint(x: a[0] + a[2], y: a[1] + a[3])
+          func post(_ type: CGEventType, _ p: CGPoint) {
+              CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+          }
+          post(.mouseMoved, start); usleep(300_000)
+          post(.leftMouseDown, start); usleep(300_000)
+          for i in 1...20 {
+              let t = Double(i) / 20
+              post(.leftMouseDragged, CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t))
+              usleep(40_000)
+          }
+          post(.leftMouseUp, end)
+          EOS
+          swift /tmp/drag.swift $((WX + 32)) $((WY + 28)) 160 90 2>&1 | tee -a out/log.txt; sleep 2
+          POS2=$(swift /tmp/winlist.swift 2>/dev/null | awk '$3==640{print $1", "$2; exit}')
+          echo "window position after drag:  $POS2" | tee -a out/log.txt
+          screencapture -x out/4b-quick-dragged.png
+          osascript -e 'tell application "System Events" to keystroke "em dash"' 2>&1 | tee -a out/log.txt; sleep 2
+          screencapture -x out/5-quick-search.png
+          osascript -e 'tell application "System Events" to key code 36' 2>&1 | tee -a out/log.txt; sleep 2
+          say "clipboard after quick lookup (expect e2 80 94 = em dash)"
+          pbpaste | xxd | tee -a out/log.txt
+          screencapture -x out/6-quick-after.png
+
+          say "command-C in Quick Lookup copies and dismisses (expect e2 80 93 = en dash, Quick Lookup closed)"
+          printf 'x' | pbcopy
+          osascript -e 'tell application "System Events" to key code 49 using {control down, option down}' 2>&1 | tee -a out/log.txt; sleep 3
+          osascript -e 'tell application "System Events" to keystroke "en dash"' 2>&1 | tee -a out/log.txt; sleep 2
+          osascript -e 'tell application "System Events" to keystroke "c" using command down' 2>&1 | tee -a out/log.txt; sleep 2
+          pbpaste | xxd | tee -a out/log.txt
+          echo "windows after command-C: $(osascript -e 'tell application "System Events" to tell process "Typecase" to count windows' 2>&1)" | tee -a out/log.txt
+          screencapture -x out/6b-quick-command-c.png
+
+          say "typing instructions: e acute (dead key) and euro (single stroke)"
+          osascript -e 'tell application "Typecase" to activate' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "f" using command down' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "a" using command down' 2>&1 | tee -a out/log.txt
+          osascript -e 'tell application "System Events" to keystroke "e acute"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/8-e-acute.png
+          osascript -e 'tell application "System Events" to keystroke "a" using command down' 2>&1 | tee -a out/log.txt
+          osascript -e 'tell application "System Events" to keystroke "euro"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/9-euro.png
+
+          say "menu bar item: a click opens Quick Lookup"
+          osascript -e 'tell application "System Events" to tell process "Typecase" to click menu bar item 1 of menu bar 2' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/10-menubar-click.png
+          say "menu bar item: a click while Quick Lookup is showing opens the menu"
+          osascript -e 'tell application "System Events" to tell process "Typecase" to click menu bar item 1 of menu bar 2' 2>&1 | tee -a out/log.txt; sleep 2
+          screencapture -x out/10b-menubar-menu.png
+          osascript -e 'tell application "System Events" to key code 53' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to key code 53' 2>&1 | tee -a out/log.txt; sleep 1
+
+          say "dark mode"
+          osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true' 2>&1 | tee -a out/log.txt; sleep 4
+          osascript -e 'tell application "Typecase" to activate' 2>&1 | tee -a out/log.txt; sleep 2
+          screencapture -x out/11-dark-main.png
+          osascript -e 'tell application "System Events" to key code 49 using {control down, option down}' 2>&1 | tee -a out/log.txt; sleep 3
+          osascript -e 'tell application "System Events" to keystroke "arrow"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/12-dark-quick.png
+          osascript -e 'tell application "System Events" to key code 53' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to false' 2>&1 | tee -a out/log.txt; sleep 2
+
+          say "settings"
+          osascript -e 'tell application "Typecase" to activate' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "," using command down' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/7-settings.png
+
+          say "command-return in Quick Lookup shows the glyph in the main window"
+          osascript -e 'tell application "System Events" to key code 49 using {control down, option down}' 2>&1 | tee -a out/log.txt; sleep 3
+          osascript -e 'tell application "System Events" to keystroke "tilde"' 2>&1 | tee -a out/log.txt; sleep 3
+          osascript -e 'tell application "System Events" to key code 36 using {command down}' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/16-open-in-app.png
+
+          say "Open Typecase from the menu bar menu closes Quick Lookup"
+          osascript -e 'tell application "System Events" to key code 49 using {control down, option down}' 2>&1 | tee -a out/log.txt; sleep 3
+          echo "windows with Quick Lookup open: $(osascript -e 'tell application "System Events" to count windows of process "Typecase"' 2>&1)" | tee -a out/log.txt
+          screencapture -x out/16b-quick-open-before-menu.png
+          osascript -e 'tell application "System Events" to tell process "Typecase" to click menu bar item 1 of menu bar 2' 2>&1 | tee -a out/log.txt; sleep 2
+          osascript -e 'tell application "System Events" to tell process "Typecase" to click menu item "Open Typecase" of menu 1 of menu bar item 1 of menu bar 2' 2>&1 | tee -a out/log.txt; sleep 3
+          echo "windows after choosing Open Typecase (expect one fewer): $(osascript -e 'tell application "System Events" to count windows of process "Typecase"' 2>&1)" | tee -a out/log.txt
+          screencapture -x out/16c-after-open-from-menu.png
+
+          say "Dock icon follows the main window when Always show in Dock is off"
+          osascript -e 'tell application "Typecase" to quit' 2>&1 | tee -a out/log.txt; sleep 4
+          open -n "$APP" --args -showInDock NO; sleep 10
+          BG() { osascript -e 'tell application "System Events" to get background only of process "Typecase"' 2>&1; }
+          echo "background only, main window open (expect false): $(BG)" | tee -a out/log.txt
+          osascript -e 'tell application "Typecase" to activate' 2>&1 | tee -a out/log.txt; sleep 1
+
+          say "grid: click a cell, End, Home, Page Down, then a burst of fast scrolling"
+          swift /tmp/drag.swift 420 260 0 0 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to key code 119' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/19-grid-end.png
+          osascript -e 'tell application "System Events" to key code 115' 2>&1 | tee -a out/log.txt; sleep 2
+          screencapture -x out/20-grid-home.png
+          for i in 1 2 3 4 5 6 7 8 9 10; do osascript -e 'tell application "System Events" to key code 121' 2>&1 | tee -a out/log.txt; done; sleep 2
+          screencapture -x out/21-grid-pagedown.png
+          cat > /tmp/scroll.swift <<'EOS'
+          import CoreGraphics
+          import Foundation
+          let a = CommandLine.arguments.dropFirst().map { Int($0)! }
+          func post(_ type: CGEventType, _ p: CGPoint) {
+              CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: .left)?.post(tap: .cghidEventTap)
+          }
+          post(.mouseMoved, CGPoint(x: 420, y: 300)); usleep(300_000)
+          for _ in 0..<a[0] {
+              CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: Int32(a[1]), wheel2: 0, wheel3: 0)?
+                  .post(tap: .cghidEventTap)
+              usleep(4_000)
+          }
+          EOS
+          swift /tmp/scroll.swift 400 -40 2>&1 | tee -a out/log.txt
+          T0=$(python3 -c 'import time;print(int(time.time()*1000))')
+          osascript -e 'tell application "System Events" to get name of front window of process "Typecase"' 2>&1 | tee -a out/log.txt
+          T1=$(python3 -c 'import time;print(int(time.time()*1000))')
+          echo "app answered an accessibility query $((T1 - T0)) ms after a burst of 400 fast scroll events" | tee -a out/log.txt
+          sleep 3
+          screencapture -x out/22-after-fast-scroll.png
+
+          osascript -e 'tell application "System Events" to keystroke "w" using command down' 2>&1 | tee -a out/log.txt; sleep 3
+          echo "background only, main window closed (expect true): $(BG)" | tee -a out/log.txt
+          screencapture -x out/17-dock-hidden.png
+          osascript -e 'tell application "Typecase" to reopen' 2>&1 | tee -a out/log.txt; sleep 4
+          echo "background only, window reopened (expect false): $(BG)" | tee -a out/log.txt
+          screencapture -x out/18-dock-shown-again.png
+
+          say "open a font file: relaunch with TYPECASE_OPEN_FONT (a path inside the sandbox container)"
+          osascript -e 'tell application "Typecase" to quit' 2>&1 | tee -a out/log.txt; sleep 4
+          CONTAINER="$HOME/Library/Containers/com.milanelsen.typecase/Data"
+          FONT="/System/Library/Fonts/Supplemental/Courier New.ttf"
+          [ -f "$FONT" ] || FONT=$(find /System/Library/Fonts -name "*.ttf" | head -1)
+          echo "font: $FONT" | tee -a out/log.txt
+          mkdir -p "$CONTAINER/tmp" && cp "$FONT" "$CONTAINER/tmp/test.ttf" 2>&1 | tee -a out/log.txt
+          open -n --env TYPECASE_OPEN_FONT="$CONTAINER/tmp/test.ttf" "$APP"; sleep 12
+          osascript -e 'tell application "Typecase" to activate' 2>&1 | tee -a out/log.txt; sleep 2
+          screencapture -x out/13-font-view.png
+          osascript -e 'tell application "System Events" to keystroke "f" using command down' 2>&1 | tee -a out/log.txt; sleep 1
+          osascript -e 'tell application "System Events" to keystroke "arrow"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/14-font-missing-arrows.png
+          osascript -e 'tell application "System Events" to keystroke "a" using command down' 2>&1 | tee -a out/log.txt
+          osascript -e 'tell application "System Events" to keystroke "space"' 2>&1 | tee -a out/log.txt; sleep 3
+          screencapture -x out/15-font-spaces.png
+          pgrep -lx Typecase | tee -a out/log.txt || say "NOT RUNNING after opening a font"
+
+          say "still running?"
+          pgrep -lx Typecase | tee -a out/log.txt || say "NOT RUNNING at end"
+
+      - name: Collect logs
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p out
+          ls -la ~/Library/Logs/DiagnosticReports 2>/dev/null | tee -a out/log.txt || true
+          cp ~/Library/Logs/DiagnosticReports/Typecase* out/ 2>/dev/null || true
+          /usr/bin/log show --last 5m --style compact --predicate 'process == "Typecase"' 2>/dev/null | tail -n 150 > out/system-log.txt || true
+
+      - name: Publish to ci-artifacts branch
+        if: always()
+        run: |
+          set -e
+          mkdir -p /tmp/publish && cp -R out/. /tmp/publish/
+          cd /tmp/publish
+          git init -q
+          git config user.name "ci"
+          git config user.email "ci@users.noreply.github.com"
+          BRANCH=ci-artifacts
+          RUNNER="${{ inputs.runner }}"
+          if [ -n "$RUNNER" ] && [ "$RUNNER" != "macos-15" ]; then BRANCH="ci-artifacts-$RUNNER"; fi
+          if [ -n "${{ inputs.app_ref }}" ]; then BRANCH="$BRANCH-base"; fi
+          git checkout -q -b "$BRANCH"
+          git add .
+          git commit -q -m "UI smoke test output for ${GITHUB_SHA} on ${RUNNER:-macos-15}"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -f origin "$BRANCH"
